@@ -1,0 +1,4 @@
+python -m venv venv
+venv\Scripts\activate
+pip install pandas numpy matplotlib seaborn scikit-learn tensorflow shap statsmodels
+python rice_disease_lstm_forecasting.py
