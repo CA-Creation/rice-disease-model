@@ -7,11 +7,16 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
+import matplotlib
+matplotlib.use("Agg")  # non-GUI backend for saving plots only
+import matplotlib.pyplot as plt
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 from datetime import timedelta
+
 
 # --- ML imports ---
 from sklearn.model_selection import train_test_split
@@ -367,34 +372,126 @@ def score_historical_risk(model_bundle, wX, w_dates):
     return hist_df
 
 
-# =============== 5) LSTM Forecast on Risk Series ===============
+# =============== 5) LSTM Forecast + Future Prediction ===============
 
-def lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28, random_state=42):
+def lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28, random_state=42, out_dir="outputs"):
     if not HAS_TF:
         print("TensorFlow not available; skipping LSTM forecast.")
-        return pd.DataFrame(columns=["Date", "risk_prob"])
+        return pd.DataFrame(columns=["Date", "risk_prob"]), {}
 
     series = hist_df["risk_prob"].astype(float).values.reshape(-1, 1)
 
-    # scale to 0-1 for stability (min-max)
+    # scale 0-1
     s_min, s_max = series.min(), series.max()
     denom = (s_max - s_min) if s_max > s_min else 1.0
     s_norm = (series - s_min) / denom
 
-    # Build sequences
+    # sequences
     X_seq, y_seq = [], []
     for i in range(len(s_norm) - seq_len):
         X_seq.append(s_norm[i:i+seq_len, 0])
         y_seq.append(s_norm[i+seq_len, 0])
-    X_seq = np.array(X_seq)
-    y_seq = np.array(y_seq)
+    X_seq, y_seq = np.array(X_seq), np.array(y_seq)
 
-    # Train/val split (last 15% for validation)
-    n = len(X_seq)
-    split = int(n * 0.85)
+    # split train/val
+    split = int(len(X_seq)*0.85)
     X_tr, X_val = X_seq[:split], X_seq[split:]
     y_tr, y_val = y_seq[:split], y_seq[split:]
+    X_tr = X_tr.reshape((X_tr.shape[0], X_tr.shape[1], 1))
+    X_val = X_val.reshape((X_val.shape[0], X_val.shape[1], 1))
 
+    tf.random.set_seed(random_state)
+    model = Sequential([
+        LSTM(64, activation="tanh", input_shape=(seq_len,1)),
+        Dropout(0.2),
+        Dense(32, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    es = EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True, verbose=0)
+    model.fit(X_tr, y_tr, validation_data=(X_val, y_val), epochs=200, batch_size=32, callbacks=[es], verbose=0)
+
+    # Forecast iteratively
+    last_seq = s_norm[-seq_len:,0].tolist()
+    preds = []
+    for _ in range(horizon_days):
+        x = np.array(last_seq[-seq_len:]).reshape(1, seq_len,1)
+        yhat = model.predict(x, verbose=0)[0,0]
+        preds.append(yhat)
+        last_seq.append(yhat)
+
+    # De-normalize
+    preds = np.array(preds).reshape(-1,1)*denom + s_min
+    future_dates = pd.date_range(start=hist_df["Date"].max()+timedelta(days=1), periods=horizon_days, freq="D")
+    fut_df = pd.DataFrame({"Date": future_dates, "risk_prob": preds.ravel()})
+    fut_df.to_csv(os.path.join(out_dir, "forecast_risk_future.csv"), index=False)
+
+    # --- Future risk summary ---
+    fut_summary = {
+        "forecast_mean_risk": fut_df["risk_prob"].mean(),
+        "forecast_max_risk": fut_df["risk_prob"].max(),
+        "forecast_min_risk": fut_df["risk_prob"].min(),
+        "high_risk_days_count": (fut_df["risk_prob"]>0.6).sum(),
+        "top_5_forecast_risk_dates": fut_df.nlargest(5, "risk_prob")["Date"].dt.strftime("%Y-%m-%d").tolist()
+    }
+
+    # Visualization
+    # Compute monthly risk DataFrame
+    fut_df["Year"] = fut_df["Date"].dt.year
+    fut_df["Month"] = fut_df["Date"].dt.month
+    monthly_risk_df = fut_df.groupby(["Year", "Month"], as_index=False)["risk_prob"].mean()
+    monthly_risk_df["Month"] = pd.to_datetime(monthly_risk_df["Year"].astype(str) + "-" + monthly_risk_df["Month"].astype(str) + "-01")
+
+    plt.figure(figsize=(12,5))
+    plt.plot(monthly_risk_df["Month"], monthly_risk_df["risk_prob"],
+            marker="o", color="green", label="Monthly Forecast Risk")
+    plt.title("Rice Disease Forecast Risk: Next 24 Months")
+    plt.xlabel("Month")
+    plt.ylabel("Mean Predicted Risk Probability")
+    plt.xticks(rotation=30)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_risk_2yr_monthly_line.png"), dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(8,4))
+    plt.hist(fut_df["risk_prob"], bins=25, color="red", alpha=0.7)
+    plt.title("Forecast Risk Distribution")
+    plt.xlabel("Predicted risk")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_risk_distribution.png"), dpi=150)
+    plt.close()
+
+    print("\n=== Future Risk Summary ===")
+    print(fut_summary)
+    return fut_df, fut_summary
+
+
+    # =============== 5b) 2-Year Monthly Future Risk Forecast ===============
+
+def lstm_forecast_future_monthly(hist_df, months_ahead=24, seq_len=28, random_state=42, out_dir="outputs"):
+    if not HAS_TF:
+        print("TensorFlow not available; skipping LSTM forecast.")
+        return pd.DataFrame(columns=["Year", "Month", "mean_risk"])
+
+    # --- Daily forecast first ---
+    horizon_days = months_ahead * 30  # approx days
+    series = hist_df["risk_prob"].astype(float).values.reshape(-1, 1)
+
+    s_min, s_max = series.min(), series.max()
+    denom = (s_max - s_min) if s_max > s_min else 1.0
+    s_norm = (series - s_min) / denom
+
+    X_seq, y_seq = [], []
+    for i in range(len(s_norm) - seq_len):
+        X_seq.append(s_norm[i:i+seq_len, 0])
+        y_seq.append(s_norm[i+seq_len, 0])
+    X_seq, y_seq = np.array(X_seq), np.array(y_seq)
+
+    split = int(len(X_seq) * 0.85)
+    X_tr, X_val = X_seq[:split], X_seq[split:]
+    y_tr, y_val = y_seq[:split], y_seq[split:]
     X_tr = X_tr.reshape((X_tr.shape[0], X_tr.shape[1], 1))
     X_val = X_val.reshape((X_val.shape[0], X_val.shape[1], 1))
 
@@ -409,7 +506,7 @@ def lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28, random_state=42):
     es = EarlyStopping(monitor="val_loss", patience=12, restore_best_weights=True, verbose=0)
     model.fit(X_tr, y_tr, validation_data=(X_val, y_val), epochs=200, batch_size=32, callbacks=[es], verbose=0)
 
-    # Forecast iteratively
+    # Iterative daily forecast
     last_seq = s_norm[-seq_len:, 0].tolist()
     preds = []
     for _ in range(horizon_days):
@@ -418,20 +515,45 @@ def lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28, random_state=42):
         preds.append(yhat)
         last_seq.append(yhat)
 
-    # De-normalize
     preds = np.array(preds).reshape(-1, 1) * denom + s_min
     future_dates = pd.date_range(start=hist_df["Date"].max() + timedelta(days=1), periods=horizon_days, freq="D")
     fut_df = pd.DataFrame({"Date": future_dates, "risk_prob": preds.ravel()})
-    return fut_df
+
+    # --- Aggregate to month-year ---
+    fut_df["Year"] = fut_df["Date"].dt.year
+    fut_df["Month"] = fut_df["Date"].dt.month
+    monthly_risk = fut_df.groupby(["Year", "Month"], as_index=False)["risk_prob"].mean()
+    monthly_risk.to_csv(os.path.join(out_dir, "future_monthly_risk_2yrs.csv"), index=False)
+
+    # --- Line plot ---
+    plt.figure(figsize=(12, 5))
+    plt.plot(pd.to_datetime(monthly_risk["Year"].astype(str) + "-" + monthly_risk["Month"].astype(str) + "-01"),
+             monthly_risk["risk_prob"], marker='o')
+    plt.title("Predicted Monthly Rice Disease Risk (Next 2 Years)")
+    plt.xlabel("Month-Year")
+    plt.ylabel("Mean Predicted Risk")
+    plt.xticks(rotation=45)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "future_monthly_risk_2yrs.png"), dpi=150)
+    plt.close()
+
+    print("\n2-Year Monthly Forecast CSV & Line Graph saved.")
+    return monthly_risk
 
 
-# =============== 6) Season/Maha-Yala Analysis & Plots ===============
+
+# =============== 6) Season/Maha-Yala Analysis & Plots (Enhanced) ===============
 
 def analyze_and_plot(hist_df, fut_df, out_dir="outputs"):
+    all_df = pd.concat([hist_df.assign(part="history"), fut_df.assign(part="forecast")], ignore_index=True)
+    all_df = add_season_cols(all_df, "Date")
+
+    # 1) Risk timeseries plot
     plt.figure(figsize=(12, 5))
     plt.plot(hist_df["Date"], hist_df["risk_prob"], label="Historical risk")
     if len(fut_df):
-        plt.plot(fut_df["Date"], fut_df["risk_prob"], label="Forecast risk")
+        plt.plot(fut_df["Date"], fut_df["risk_prob"], label="Forecast risk", linestyle="--")
     plt.title("Rice Disease Risk: Historical & Forecast")
     plt.xlabel("Date"); plt.ylabel("Risk probability")
     plt.legend()
@@ -439,11 +561,7 @@ def analyze_and_plot(hist_df, fut_df, out_dir="outputs"):
     plt.savefig(os.path.join(out_dir, "risk_timeseries.png"), dpi=150)
     plt.close()
 
-    # Combine and season stats
-    all_df = pd.concat([hist_df.assign(part="history"), fut_df.assign(part="forecast")], ignore_index=True)
-    all_df = add_season_cols(all_df, "Date")
-
-    # Monthly risk
+    # 2) Monthly analysis
     monthly = all_df.groupby("month", as_index=False)["risk_prob"].mean()
     plt.figure(figsize=(8, 4))
     plt.bar(monthly["month"].astype(int), monthly["risk_prob"])
@@ -453,7 +571,7 @@ def analyze_and_plot(hist_df, fut_df, out_dir="outputs"):
     plt.savefig(os.path.join(out_dir, "monthly_risk_bar.png"), dpi=150)
     plt.close()
 
-    # Season risk (Maha vs Yala)
+    # 3) Season risk
     season_mean = all_df.groupby("season", as_index=False)["risk_prob"].mean().sort_values("risk_prob")
     plt.figure(figsize=(6, 4))
     plt.bar(season_mean["season"], season_mean["risk_prob"])
@@ -463,26 +581,54 @@ def analyze_and_plot(hist_df, fut_df, out_dir="outputs"):
     plt.savefig(os.path.join(out_dir, "season_risk_bar.png"), dpi=150)
     plt.close()
 
-    # Season-year trend (useful for reporting)
+    # 4) Risk histogram
+    plt.figure(figsize=(8,4))
+    plt.hist(all_df["risk_prob"], bins=25, color="orange", alpha=0.7)
+    plt.title("Distribution of Rice Disease Risk")
+    plt.xlabel("Predicted risk")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "risk_distribution.png"), dpi=150)
+    plt.close()
+
+    # 5) Season-year trend
     seas_year = all_df.groupby(["season", "season_year"], as_index=False)["risk_prob"].mean()
     pivot = seas_year.pivot(index="season_year", columns="season", values="risk_prob").sort_index()
     pivot.to_csv(os.path.join(out_dir, "season_year_risk.csv"), index=True)
 
-    # Best/worst months and seasons (by mean risk)
+    # 6) Best/worst months & seasons
     best_month = int(monthly.loc[monthly["risk_prob"].idxmin(), "month"])
     worst_month = int(monthly.loc[monthly["risk_prob"].idxmax(), "month"])
     best_season = season_mean.iloc[0]["season"]
     worst_season = season_mean.iloc[-1]["season"]
 
+    # 7) Top risky dates
+    top_hist = hist_df.nlargest(5, "risk_prob")[["Date","risk_prob"]]
+    top_fut  = fut_df.nlargest(5, "risk_prob")[["Date","risk_prob"]]
+
+    # 8) Future risk summary
+    fut_summary = {
+        "forecast_mean_risk": fut_df["risk_prob"].mean() if len(fut_df) else np.nan,
+        "forecast_max_risk": fut_df["risk_prob"].max() if len(fut_df) else np.nan,
+        "forecast_min_risk": fut_df["risk_prob"].min() if len(fut_df) else np.nan,
+        "high_risk_days_count": (fut_df["risk_prob"]>0.6).sum() if len(fut_df) else 0,
+        "top_5_forecast_risk_dates": top_fut["Date"].dt.strftime("%Y-%m-%d").tolist() if len(fut_df) else []
+    }
+
     summary = {
         "best_month_lowest_risk": best_month,
         "worst_month_highest_risk": worst_month,
         "best_season_lowest_risk": best_season,
-        "worst_season_highest_risk": worst_season
+        "worst_season_highest_risk": worst_season,
+        **fut_summary
     }
+
+    # Save top dates and summary
+    top_hist.to_csv(os.path.join(out_dir, "top_5_historical_risk.csv"), index=False)
     pd.Series(summary).to_csv(os.path.join(out_dir, "best_worst_summary.csv"))
-    print("\n=== Season/Month Summary ===")
+    print("\n=== Season/Month/Future Summary ===")
     print(summary)
+
     return all_df, summary
 
 
@@ -493,20 +639,22 @@ def main():
     print("Loading & aligning datasets...")
     fX, y_presence, y_type_raw, wX, w_dates, feature_names = load_datasets()
 
+    # ------------------- Train presence model -------------------
     print("Training presence classifier (calibrated)...")
     presence_bundle = train_presence_model(fX, y_presence)
 
+    # ------------------- Explainability -------------------
     print("Explainability (SHAP or fallback)...")
     explain_global_importance(presence_bundle, fX, feature_names, out_dir=out_dir)
 
+    # ------------------- Historical risk scoring -------------------
     print("Scoring historical risk on Anuradhapura dataset...")
     hist_df = score_historical_risk(presence_bundle, wX, w_dates)
     hist_df.to_csv(os.path.join(out_dir, "historical_risk.csv"), index=False)
 
-    # (Optional) disease type model
+    # ------------------- Disease type model -------------------
     type_bundle, type_classes = train_type_model(fX, y_presence, y_type_raw)
     if type_bundle is not None:
-        # Score likely type only when risk > 0.5 for reporting
         Xs_w = type_bundle["scaler"].transform(wX.values)
         type_pred = type_bundle["clf"].predict(Xs_w)
         type_labels = pd.Series(type_pred).map({i: c for i, c in enumerate(type_classes)})
@@ -515,19 +663,51 @@ def main():
         typed.loc[typed["risk_prob"] < 0.5, "predicted_type"] = "None/Low"
         typed.to_csv(os.path.join(out_dir, "historical_type_when_risky.csv"), index=False)
 
-    print("LSTM forecasting future disease risk...")
-    fut_df = lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28)
+    # ------------------- LSTM 60-day forecast -------------------
+    print("LSTM forecasting future disease risk (next 60 days)...")
+    fut_df, fut_summary = lstm_forecast_risk(hist_df, horizon_days=60, seq_len=28, out_dir=out_dir)
     fut_df.to_csv(os.path.join(out_dir, "forecast_risk_60d.csv"), index=False)
+    pd.Series(fut_summary).to_csv(os.path.join(out_dir, "forecast_risk_60d_summary.csv"))
 
-    print("Season-wise analysis & plotting...")
+    # Plot 60-day forecast line graph
+    plt.figure(figsize=(10,5))
+    plt.plot(fut_df["Date"], fut_df["risk_prob"], color="red", label="Forecast Risk (60 days)")
+    plt.title("Rice Disease Forecast Risk: Next 60 Days")
+    plt.xlabel("Date")
+    plt.ylabel("Predicted Risk Probability")
+    plt.xticks(rotation=30)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_risk_60d_line.png"), dpi=150)
+    plt.close()
+
+    # ------------------- 2-year monthly forecast -------------------
+    print("Forecasting monthly disease risk for next 2 years...")
+    monthly_risk_df = lstm_forecast_future_monthly(hist_df, months_ahead=24, seq_len=28, out_dir=out_dir)
+    monthly_risk_df.to_csv(os.path.join(out_dir, "forecast_risk_2yr_monthly.csv"), index=False)
+
+    # Plot 2-year monthly forecast line graph
+    plt.figure(figsize=(12,5))
+    plt.plot(monthly_risk_df["Month"], monthly_risk_df["predicted_risk"],
+         marker="o", color="green", label="Monthly Forecast Risk")
+    plt.title("Rice Disease Forecast Risk: Next 24 Months")
+    plt.xlabel("Month")
+    plt.ylabel("Mean Predicted Risk Probability")
+    plt.xticks(rotation=30)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_risk_2yr_monthly_line.png"), dpi=150)
+    plt.close()
+
+    # ------------------- Season-wise analysis & plotting -------------------
     all_df, summary = analyze_and_plot(hist_df, fut_df, out_dir=out_dir)
 
-    # Partial Dependence (optional, simple top-3 features), pure matplotlib
+    # ------------------- Partial Dependence / top-3 features -------------------
     try:
         clf = presence_bundle["clf"]
         scaler = presence_bundle["scaler"]
         Xs = scaler.transform(fX.values)
-        # pick top 3 features by variance as a simple heuristic; or use feature_importances_ if available
+
         top_feats = feature_names
         if hasattr(clf, "estimator_") and hasattr(clf.estimator_, "feature_importances_"):
             fi = clf.estimator_.feature_importances_
@@ -538,7 +718,6 @@ def main():
             top_idx = np.argsort(fi)[::-1][:min(3, len(feature_names))]
             top_feats = [feature_names[i] for i in top_idx]
         else:
-            # fallback: variance
             top_idx = np.argsort(np.var(Xs, axis=0))[::-1][:min(3, len(feature_names))]
             top_feats = [feature_names[i] for i in top_idx]
 
@@ -554,7 +733,8 @@ def main():
             except Exception:
                 plt.scatter(fX.values[:, feat_idx], clf.predict_proba(Xs)[:, 1], s=6)
                 plt.title(f"Risk vs {feat}")
-                plt.xlabel(feat); plt.ylabel("Predicted risk")
+                plt.xlabel(feat)
+                plt.ylabel("Predicted risk")
                 plt.tight_layout()
                 plt.savefig(os.path.join(out_dir, f"risk_vs_{feat}.png"), dpi=150)
                 plt.close()
@@ -562,10 +742,15 @@ def main():
     except Exception as e:
         print("PDP step skipped:", e)
 
+    # ------------------- Final output -------------------
     print(f"\nAll done. Outputs saved in: {os.path.abspath(out_dir)}")
     print("Key files:")
     print(" - outputs/historical_risk.csv")
     print(" - outputs/forecast_risk_60d.csv")
+    print(" - outputs/forecast_risk_60d_summary.csv")
+    print(" - outputs/forecast_risk_60d_line.png")
+    print(" - outputs/forecast_risk_2yr_monthly.csv")
+    print(" - outputs/forecast_risk_2yr_monthly_line.png")
     print(" - outputs/season_year_risk.csv")
     print(" - outputs/best_worst_summary.csv")
     print(" - outputs/shap_importance_bar.png (or permutation_importance_bar.png)")
