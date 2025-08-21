@@ -659,7 +659,7 @@ def find_low_risk_windows(df, date_col="Date", risk_col="risk_prob", threshold=0
 
 # --- UPDATED: 5-year daily forecast (with disease-type probabilities + monthly summary) ---
 def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
-                      type_bundle=None, type_classes=None):
+                      type_bundle=None, type_classes=None, y_type_raw=None):
     horizon_days = (pd.Timestamp(hist_df["Date"].max()) + pd.DateOffset(years=5) 
                     - pd.Timestamp(hist_df["Date"].max())).days
     horizon_days = max(horizon_days, 5*365+1)  # safety fallback
@@ -700,7 +700,7 @@ def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
     plt.xlabel("Month"); plt.ylabel("Mean risk"); plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "forecast_5y_monthly_mean_line.png"), dpi=150); plt.close()
 
-    # Season-year lines (reuse your add_season_cols)
+    # Season-year lines
     fut_seasoned = add_season_cols(fut_df, "Date")
     seas = fut_seasoned.groupby(["season_year","season"], as_index=False)["risk_prob"].mean()
     pv = seas.pivot(index="season_year", columns="season", values="risk_prob").sort_index()
@@ -716,30 +716,38 @@ def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
     low_windows.to_csv(os.path.join(out_dir, "forecast_5y_low_risk_windows.csv"), index=False)
 
     # --- NEW: Disease-type probabilities ---
-    if type_bundle is not None and type_classes is not None:
+    if type_classes is not None and y_type_raw is not None:
         print("Generating disease-type probabilities for 5 years...")
 
-        # Features: here we just use risk_prob
-        Xs = type_bundle["scaler"].transform(fut_df[["risk_prob"]].values)
-        probs = type_bundle["clf"].predict_proba(Xs)
+        # ⚠️ Workaround: distribute overall risk using historical disease frequencies
+        hist_types = pd.Series(y_type_raw).value_counts(normalize=True)
+        hist_freq = {cls: hist_types.get(cls, 0) for cls in type_classes}
 
-        # Build DataFrame with each disease column
-        probs_df = pd.DataFrame(probs, columns=type_classes)
-        probs_df.insert(0, "Date", fut_df["Date"].values)
+        # Normalize to sum=1
+        total = sum(hist_freq.values())
+        if total == 0:
+            hist_freq = {cls: 1/len(type_classes) for cls in type_classes}
+        else:
+            hist_freq = {cls: val/total for cls, val in hist_freq.items()}
+
+        # Build probabilities DataFrame
+        probs_df = fut_df[["Date"]].copy()
+        for disease in type_classes:
+            probs_df[disease] = fut_df["risk_prob"] * hist_freq[disease]
 
         # Save daily disease-type CSV
         out_csv = os.path.join(out_dir, "forecast_5y_disease_types.csv")
         probs_df.to_csv(out_csv, index=False)
         print(f"Saved disease-type 5-year forecast CSV → {out_csv}")
 
-        # --- NEW: Monthly summary per disease ---
+        # --- Monthly summary per disease ---
         probs_df["ym"] = pd.to_datetime(probs_df["Date"]).dt.to_period("M").dt.to_timestamp("M")
         monthly_probs = probs_df.groupby("ym")[type_classes].mean().reset_index()
         monthly_csv = os.path.join(out_dir, "forecast_5y_disease_types_monthly.csv")
         monthly_probs.to_csv(monthly_csv, index=False)
         print(f"Saved disease-type monthly summary CSV → {monthly_csv}")
 
-        # Combined line chart
+        # Combined monthly line chart
         plt.figure(figsize=(12, 5))
         for disease in type_classes:
             plt.plot(monthly_probs["ym"], monthly_probs[disease], label=disease)
@@ -749,7 +757,7 @@ def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
         plt.savefig(os.path.join(out_dir, "forecast_5y_disease_types_monthly.png"), dpi=150)
         plt.close()
 
-        # Individual line graphs
+        # Individual monthly line graphs
         for disease in type_classes:
             plt.figure(figsize=(12, 4))
             plt.plot(monthly_probs["ym"], monthly_probs[disease])
@@ -760,9 +768,6 @@ def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
             plt.close()
 
     return fut_df, low_windows
-
-
-
 
 # =============== 7) Main Orchestration ===============
 
@@ -801,9 +806,10 @@ def main():
             hist_df,
             seq_len=28,
             out_dir=out_dir,
-            type_bundle=type_bundle,
-            type_classes=type_classes
+            type_classes=type_classes,
+            y_type_raw=y_type_raw   
         )
+
         print("Saved:", "outputs/forecast_risk_5y_daily.csv",
             "and", "outputs/forecast_5y_low_risk_windows.csv")
         print("Top low-risk windows:")
