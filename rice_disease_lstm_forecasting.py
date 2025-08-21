@@ -631,6 +631,138 @@ def analyze_and_plot(hist_df, fut_df, out_dir="outputs"):
 
     return all_df, summary
 
+# --- NEW: helper to find contiguous low-risk windows ---
+def find_low_risk_windows(df, date_col="Date", risk_col="risk_prob", threshold=0.40, min_days=21):
+    s = df[[date_col, risk_col]].sort_values(date_col).reset_index(drop=True)
+    mask = s[risk_col] < threshold
+    runs = []
+    start_i = None
+    for i, ok in enumerate(mask):
+        if ok and start_i is None:
+            start_i = i
+        elif not ok and start_i is not None:
+            runs.append((start_i, i-1))
+            start_i = None
+    if start_i is not None:
+        runs.append((start_i, len(s)-1))
+    out = []
+    for a, b in runs:
+        start, end = s.loc[a, date_col], s.loc[b, date_col]
+        length = (end - start).days + 1
+        if length >= min_days:
+            seg = s.iloc[a:b+1]
+            out.append({
+                "start_date": start, "end_date": end,
+                "length_days": length, "mean_risk": float(seg[risk_col].mean())
+            })
+    return pd.DataFrame(out).sort_values(["length_days","mean_risk"], ascending=[False, True])
+
+# --- UPDATED: 5-year daily forecast (with disease-type probabilities + monthly summary) ---
+def forecast_daily_5y(hist_df, seq_len=28, random_state=42, out_dir="outputs",
+                      type_bundle=None, type_classes=None):
+    horizon_days = (pd.Timestamp(hist_df["Date"].max()) + pd.DateOffset(years=5) 
+                    - pd.Timestamp(hist_df["Date"].max())).days
+    horizon_days = max(horizon_days, 5*365+1)  # safety fallback
+
+    try:
+        # If TensorFlow available (HAS_TF in your script), reuse your LSTM setup
+        if HAS_TF:
+            fut_df, _ = lstm_forecast_risk(hist_df, horizon_days=horizon_days,
+                                           seq_len=seq_len, out_dir=out_dir)
+        else:
+            raise RuntimeError("TF not available")
+    except Exception:
+        # Fallback: seasonal-naive — repeat last 365 days' pattern forward
+        last_year = hist_df.tail(365)["risk_prob"].to_numpy()
+        if len(last_year) < 365:
+            last_year = np.resize(last_year, 365)
+        reps = int(np.ceil(horizon_days / 365))
+        vals = np.tile(last_year, reps)[:horizon_days]
+        start = hist_df["Date"].max() + pd.Timedelta(days=1)
+        fut_dates = pd.date_range(start, periods=horizon_days, freq="D")
+        fut_df = pd.DataFrame({"Date": fut_dates, "risk_prob": vals})
+
+    # Save daily 5y CSV
+    fut_df.to_csv(os.path.join(out_dir, "forecast_risk_5y_daily.csv"), index=False)
+
+    # Rolling mean line
+    fut_df["rolling_30d"] = fut_df["risk_prob"].rolling(30, min_periods=1).mean()
+    plt.figure(figsize=(12,4)); plt.plot(fut_df["Date"], fut_df["rolling_30d"])
+    plt.title("30-Day Rolling Mean Risk — Next 5 Years")
+    plt.xlabel("Date"); plt.ylabel("Rolling mean risk"); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_5y_rolling_30d_line.png"), dpi=150); plt.close()
+
+    # Monthly mean line
+    fut_df["ym"] = fut_df["Date"].dt.to_period("M").dt.to_timestamp("M")
+    monthly = fut_df.groupby("ym", as_index=False)["risk_prob"].mean()
+    plt.figure(figsize=(12,4)); plt.plot(monthly["ym"], monthly["risk_prob"], marker="o")
+    plt.title("Monthly Mean Risk — Next 5 Years")
+    plt.xlabel("Month"); plt.ylabel("Mean risk"); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_5y_monthly_mean_line.png"), dpi=150); plt.close()
+
+    # Season-year lines (reuse your add_season_cols)
+    fut_seasoned = add_season_cols(fut_df, "Date")
+    seas = fut_seasoned.groupby(["season_year","season"], as_index=False)["risk_prob"].mean()
+    pv = seas.pivot(index="season_year", columns="season", values="risk_prob").sort_index()
+    plt.figure(figsize=(10,4))
+    for col in pv.columns:
+        plt.plot(pv.index, pv[col], marker="o", label=col)
+    plt.title("Average Risk by Season-Year (Maha vs Yala) [5y forecast]")
+    plt.xlabel("Season Year"); plt.ylabel("Mean risk"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "forecast_5y_season_year_lines.png"), dpi=150); plt.close()
+
+    # Low-risk windows CSV
+    low_windows = find_low_risk_windows(fut_df, threshold=0.40, min_days=21)
+    low_windows.to_csv(os.path.join(out_dir, "forecast_5y_low_risk_windows.csv"), index=False)
+
+    # --- NEW: Disease-type probabilities ---
+    if type_bundle is not None and type_classes is not None:
+        print("Generating disease-type probabilities for 5 years...")
+
+        # Features: here we just use risk_prob
+        Xs = type_bundle["scaler"].transform(fut_df[["risk_prob"]].values)
+        probs = type_bundle["clf"].predict_proba(Xs)
+
+        # Build DataFrame with each disease column
+        probs_df = pd.DataFrame(probs, columns=type_classes)
+        probs_df.insert(0, "Date", fut_df["Date"].values)
+
+        # Save daily disease-type CSV
+        out_csv = os.path.join(out_dir, "forecast_5y_disease_types.csv")
+        probs_df.to_csv(out_csv, index=False)
+        print(f"Saved disease-type 5-year forecast CSV → {out_csv}")
+
+        # --- NEW: Monthly summary per disease ---
+        probs_df["ym"] = pd.to_datetime(probs_df["Date"]).dt.to_period("M").dt.to_timestamp("M")
+        monthly_probs = probs_df.groupby("ym")[type_classes].mean().reset_index()
+        monthly_csv = os.path.join(out_dir, "forecast_5y_disease_types_monthly.csv")
+        monthly_probs.to_csv(monthly_csv, index=False)
+        print(f"Saved disease-type monthly summary CSV → {monthly_csv}")
+
+        # Combined line chart
+        plt.figure(figsize=(12, 5))
+        for disease in type_classes:
+            plt.plot(monthly_probs["ym"], monthly_probs[disease], label=disease)
+        plt.title("Monthly Average Disease Probabilities — 5 Year Forecast")
+        plt.xlabel("Month"); plt.ylabel("Avg predicted probability")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "forecast_5y_disease_types_monthly.png"), dpi=150)
+        plt.close()
+
+        # Individual line graphs
+        for disease in type_classes:
+            plt.figure(figsize=(12, 4))
+            plt.plot(monthly_probs["ym"], monthly_probs[disease])
+            plt.title(f"{disease} — Monthly Average (5 Year Forecast)")
+            plt.xlabel("Month"); plt.ylabel("Avg predicted probability")
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"forecast_5y_{disease}_monthly_line.png"), dpi=150)
+            plt.close()
+
+    return fut_df, low_windows
+
+
+
 
 # =============== 7) Main Orchestration ===============
 
@@ -651,7 +783,7 @@ def main():
     print("Scoring historical risk on Anuradhapura dataset...")
     hist_df = score_historical_risk(presence_bundle, wX, w_dates)
     hist_df.to_csv(os.path.join(out_dir, "historical_risk.csv"), index=False)
-
+    
     # ------------------- Disease type model -------------------
     type_bundle, type_classes = train_type_model(fX, y_presence, y_type_raw)
     if type_bundle is not None:
@@ -662,6 +794,20 @@ def main():
         typed["predicted_type"] = type_labels
         typed.loc[typed["risk_prob"] < 0.5, "predicted_type"] = "None/Low"
         typed.to_csv(os.path.join(out_dir, "historical_type_when_risky.csv"), index=False)
+        
+        # --- NEW: 5-year forecast including disease types ---
+        print("Forecasting daily disease risk for next 5 years...")
+        fut5_df, low_windows = forecast_daily_5y(
+            hist_df,
+            seq_len=28,
+            out_dir=out_dir,
+            type_bundle=type_bundle,
+            type_classes=type_classes
+        )
+        print("Saved:", "outputs/forecast_risk_5y_daily.csv",
+            "and", "outputs/forecast_5y_low_risk_windows.csv")
+        print("Top low-risk windows:")
+        print(low_windows.head())
 
     # ------------------- LSTM 60-day forecast -------------------
     print("LSTM forecasting future disease risk (next 60 days)...")
@@ -688,8 +834,7 @@ def main():
 
     # Plot 2-year monthly forecast line graph
     plt.figure(figsize=(12,5))
-    plt.plot(monthly_risk_df["Month"], monthly_risk_df["predicted_risk"],
-         marker="o", color="green", label="Monthly Forecast Risk")
+    plt.plot(monthly_risk_df["Month"], monthly_risk_df["risk_prob"], marker="o", color="green", label="Monthly Forecast Risk")
     plt.title("Rice Disease Forecast Risk: Next 24 Months")
     plt.xlabel("Month")
     plt.ylabel("Mean Predicted Risk Probability")
