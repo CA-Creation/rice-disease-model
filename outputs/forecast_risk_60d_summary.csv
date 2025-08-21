@@ -1,6 +1,6 @@
 ,0
-forecast_mean_risk,0.003988841152749956
-forecast_max_risk,0.0039903768338263035
-forecast_min_risk,0.003987873904407024
+forecast_mean_risk,0.007598625604684154
+forecast_max_risk,0.007598801050335169
+forecast_min_risk,0.0075956229120492935
 high_risk_days_count,0
-top_5_forecast_risk_dates,"['2025-01-09', '2025-01-10', '2025-01-08', '2025-01-11', '2025-01-07']"
+top_5_forecast_risk_dates,"['2025-02-07', '2025-02-15', '2025-03-01', '2025-01-28', '2025-01-29']"

@@ -8,7 +8,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import matplotlib
-matplotlib.use("Agg")  # non-GUI backend for saving plots only
+matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 
 import numpy as np
