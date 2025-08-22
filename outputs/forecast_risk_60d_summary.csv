@@ -1,0 +1,6 @@
+,0
+forecast_mean_risk,0.021441189106553793
+forecast_max_risk,0.021445835009217262
+forecast_min_risk,0.021405799314379692
+high_risk_days_count,0
+top_5_forecast_risk_dates,"['2030-01-30', '2030-01-31', '2030-02-01', '2030-02-02', '2030-02-03']"

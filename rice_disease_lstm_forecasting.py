@@ -141,10 +141,9 @@ def find_columns(df: pd.DataFrame, wanted: dict) -> dict:
 
 # =============== 1) Load & Harmonize Data ===============
 
-def load_datasets(
-    factors_path="Rice_Deseases_Factors_550.csv",
-    weather_path="rice_disease_data.csv"
-):
+def load_datasets(factors_path="Rice_Deseases_Factors_550.csv", 
+                  weather_path="rice_forecast_5years.csv"):
+
     # Read
     factors_df = pd.read_csv(factors_path)
     weather_df = pd.read_csv(weather_path, encoding='ISO-8859-1')
